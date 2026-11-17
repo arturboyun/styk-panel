@@ -1,0 +1,27 @@
+[Unit]
+Description=styk-agent: host helper for Styk Panel (unix socket only)
+After=network.target docker.service
+
+[Service]
+ExecStart=/usr/local/bin/styk-agent
+Environment=STYK_AGENT_SOCKET=/run/styk-agent/agent.sock
+EnvironmentFile=/etc/styk-agent.env
+User=root
+Group=styk-agent
+# Kept across restarts: the panel container bind-mounts this directory.
+RuntimeDirectory=styk-agent
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+# ss and nft talk netlink; long tasks run as separate transient units.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target

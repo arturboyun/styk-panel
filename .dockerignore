@@ -1,0 +1,6 @@
+target
+.dev
+frontend/node_modules
+frontend/.next
+frontend/out
+.git

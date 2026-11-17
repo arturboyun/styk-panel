@@ -1,0 +1,578 @@
+#!/usr/bin/env bash
+# styk: installs, updates and looks after Styk Panel on a Debian or Ubuntu server.
+#
+#   styk setup panel --domain panel.example.com   first install (install.sh runs this)
+#   styk status                                   versions, containers, agent, last update
+#   styk update [vX.Y.Z]                          newest (or given) release, rolls back on failure
+#   styk rollback                                 back to the release before the last update
+#   styk doctor                                   checks Docker, agent, panel, HTTPS, disk, versions
+#   styk logs [panel|db|caddy|agent]              follow logs
+#   styk backup                                   pg_dump of the panel database now
+#   styk passwd <user>                            new random password for a panel user
+#   styk restart                                  re-read .env, restart panel and agent
+#   styk uninstall [--purge]                      remove the panel (--purge: data too)
+#
+# Every release is checked before anything is installed: SHA256SUMS must carry a valid
+# minisign signature from the key below, and each file must match its checksum. The panel
+# image is pinned by digest from the signed IMAGE file, so a moved tag changes nothing.
+set -euo pipefail
+
+REPO="${STYK_REPO:-@STYK_REPO@}"
+PUBKEY="${STYK_PUBKEY:-@MINISIGN_PUBKEY@}"
+CLI_VERSION="@VERSION@"
+# Local directory with release files instead of GitHub (tests, offline installs). An
+# image.tar in it is loaded into Docker as is: it is not covered by the signature.
+RELEASE_DIR="${STYK_RELEASE_DIR:-}"
+
+APP=/opt/styk-panel
+STATE_DIR=/var/lib/styk
+BACKUP_DIR=/var/backups/styk-panel
+AGENT_BIN=/usr/local/bin/styk-agent
+AGENT_UNIT=/etc/systemd/system/styk-agent.service
+AGENT_ENV=/etc/styk-agent.env
+CLI=/usr/local/bin/styk
+
+YES=0
+if [ -t 1 ]; then B=$'\e[1m' G=$'\e[32m' R=$'\e[31m' Y=$'\e[33m' N=$'\e[0m'; else B='' G='' R='' Y='' N=''; fi
+
+log() { printf '%s==>%s %s\n' "$B" "$N" "$*"; }
+ok() { printf '  %s✓%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '  %s!%s %s\n' "$Y" "$N" "$*" >&2; }
+bad() { printf '  %s✗%s %s\n' "$R" "$N" "$*"; }
+die() { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+
+need_root() { [ "$(id -u)" = 0 ] || die "run as root (sudo styk $*)"; }
+
+confirm() {
+    [ "$YES" = 1 ] && return 0
+    [ -r /dev/tty ] || die "$1: pass --yes to confirm without a terminal"
+    local a
+    read -r -p "$1 [y/N] " a </dev/tty
+    [[ "$a" =~ ^[Yy]$ ]]
+}
+
+compose() { docker compose --progress quiet --project-directory "$APP" -f "$APP/compose.yml" "$@"; }
+
+env_get() { [ -f "$APP/.env" ] && sed -n "s/^$1=//p" "$APP/.env" | tail -n1 || true; }
+
+env_set() {
+    local key="$1" val="$2"
+    if grep -q "^$key=" "$APP/.env"; then
+        sed -i "s|^$key=.*|$key=$val|" "$APP/.env"
+    else
+        printf '%s=%s\n' "$key" "$val" >>"$APP/.env"
+    fi
+}
+
+arch() {
+    case "$(uname -m)" in
+    x86_64 | amd64) echo amd64 ;;
+    aarch64 | arm64) echo arm64 ;;
+    *) die "unsupported CPU $(uname -m): amd64 and arm64 only" ;;
+    esac
+}
+
+FROM=""
+write_state() { # state version [error]
+    mkdir -p "$STATE_DIR"
+    [ -n "$FROM" ] || FROM="$(cat "$STATE_DIR/version" 2>/dev/null || echo unknown)"
+    printf '{"state":"%s","from":"%s","to":"%s","ts":%s,"error":"%s"}\n' \
+        "$1" "$FROM" "$2" "$(date +%s)" "${3:-}" >"$STATE_DIR/update.json.part"
+    mv -f "$STATE_DIR/update.json.part" "$STATE_DIR/update.json"
+}
+
+# ---- release download and verification --------------------------------------------------
+
+FILES=(VERSION IMAGE styk install.sh compose.yml env.example styk-agent.service)
+
+ensure_minisign() {
+    command -v minisign >/dev/null && return
+    log "Installing minisign"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq minisign >/dev/null ||
+        { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq minisign >/dev/null; } ||
+        die "could not install minisign"
+}
+
+# fetch <version|latest> <dir>: downloads and verifies the release into <dir>.
+fetch() {
+    local ver="$1" dir="$2" a f base
+    a="$(arch)"
+    local files=("${FILES[@]}" "styk-agent-linux-$a")
+    [[ "$PUBKEY" == @*@ ]] && die "this styk was not built by the release workflow (no signing key)"
+    ensure_minisign
+    if [ -n "$RELEASE_DIR" ]; then
+        for f in "${files[@]}" SHA256SUMS SHA256SUMS.minisig; do cp "$RELEASE_DIR/$f" "$dir/"; done
+    else
+        if [ "$ver" = latest ]; then
+            base="https://github.com/$REPO/releases/latest/download"
+        else
+            base="https://github.com/$REPO/releases/download/$ver"
+        fi
+        for f in SHA256SUMS SHA256SUMS.minisig "${files[@]}"; do
+            curl -fsSL --retry 3 -o "$dir/$f" "$base/$f" || die "download $base/$f"
+        done
+    fi
+    minisign -Vqm "$dir/SHA256SUMS" -x "$dir/SHA256SUMS.minisig" -P "$PUBKEY" ||
+        die "SHA256SUMS signature is not valid: refusing this release"
+    for f in "${files[@]}"; do
+        grep -q "  $f\$" "$dir/SHA256SUMS" || die "$f is not in the signed SHA256SUMS"
+    done
+    (cd "$dir" && sha256sum --quiet --ignore-missing -c SHA256SUMS) || die "checksum mismatch"
+    [ "$ver" = latest ] || [ "$(cat "$dir/VERSION")" = "$ver" ] || die "release says $(cat "$dir/VERSION"), asked for $ver"
+    ok "release $(cat "$dir/VERSION") verified (minisign + sha256)"
+}
+
+# ---- pieces ---------------------------------------------------------------------------------
+
+load_local_image() {
+    [ -n "$RELEASE_DIR" ] && [ -f "$RELEASE_DIR/image.tar" ] || return 0
+    warn "loading $RELEASE_DIR/image.tar (unsigned, from the local release directory)"
+    docker load -q <"$RELEASE_DIR/image.tar" >/dev/null
+}
+
+check_os() {
+    [ -r /etc/os-release ] || die "no /etc/os-release"
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    case " ${ID:-} ${ID_LIKE:-} " in
+    *" debian "* | *" ubuntu "*) ;;
+    *) die "Debian or Ubuntu only (found ${PRETTY_NAME:-unknown})" ;;
+    esac
+    [ -d /run/systemd/system ] || die "systemd is required"
+}
+
+ensure_docker() {
+    if command -v docker >/dev/null && docker compose version >/dev/null 2>&1; then
+        ok "Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '?') with Compose"
+        return
+    fi
+    log "Installing Docker (download.docker.com)"
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    local dist="$ID"
+    case "$dist" in debian | ubuntu) ;; *) case " ${ID_LIKE:-} " in *" ubuntu "*) dist=ubuntu ;; *) dist=debian ;; esac ;; esac
+    local code="${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq ca-certificates curl >/dev/null
+    install -m 0755 -d /etc/apt/keyrings
+    if curl -fsSL "https://download.docker.com/linux/$dist/gpg" -o /etc/apt/keyrings/docker.asc &&
+        chmod a+r /etc/apt/keyrings/docker.asc &&
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$dist $code stable" \
+            >/etc/apt/sources.list.d/docker.list &&
+        apt-get update -qq &&
+        apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin >/dev/null; then
+        ok "Docker from download.docker.com"
+    else
+        warn "Docker repository failed, using the distribution packages"
+        rm -f /etc/apt/sources.list.d/docker.list
+        apt-get update -qq
+        apt-get install -y -qq docker.io >/dev/null
+        apt-get install -y -qq docker-compose-v2 >/dev/null 2>&1 || apt-get install -y -qq docker-compose-plugin >/dev/null
+    fi
+    systemctl enable --now docker >/dev/null
+    docker compose version >/dev/null || die "Docker Compose is still missing"
+}
+
+# install_agent <dir>: binary and unit from a verified release; prints "changed" if it did.
+install_agent() {
+    local dir="$1" new changed=0
+    new="$dir/styk-agent-linux-$(arch)"
+    getent group styk-agent >/dev/null || groupadd --system styk-agent
+    if [ ! -f "$AGENT_ENV" ]; then
+        printf 'STYK_AGENT_GID=%s\n' "$(getent group styk-agent | cut -d: -f3)" >"$AGENT_ENV"
+        chmod 600 "$AGENT_ENV"
+    fi
+    if ! cmp -s "$dir/styk-agent.service" "$AGENT_UNIT"; then
+        install -m 0644 "$dir/styk-agent.service" "$AGENT_UNIT"
+        systemctl daemon-reload
+        changed=1
+    fi
+    if ! cmp -s "$new" "$AGENT_BIN"; then
+        [ -f "$AGENT_BIN" ] && cp -p "$AGENT_BIN" "$AGENT_BIN.old"
+        install -m 0755 "$new" "$AGENT_BIN.new"
+        mv -f "$AGENT_BIN.new" "$AGENT_BIN"
+        changed=1
+    fi
+    systemctl enable styk-agent >/dev/null 2>&1
+    if [ "$changed" = 1 ] || ! systemctl is-active --quiet styk-agent; then
+        systemctl restart styk-agent
+    fi
+    local _
+    for _ in $(seq 1 20); do
+        [ -S /run/styk-agent/agent.sock ] && systemctl is-active --quiet styk-agent && break
+        sleep 0.5
+    done
+    systemctl is-active --quiet styk-agent || return 1
+    [ "$changed" = 1 ] && echo changed
+    return 0
+}
+
+install_cli() {
+    install -m 0755 "$1/styk" "$CLI.new"
+    mv -f "$CLI.new" "$CLI"
+}
+
+ports_busy() { ss -Hltn '( sport = :80 or sport = :443 )' 2>/dev/null | grep -q .; }
+
+dump_db() { # dump_db <tag>: prints the file name
+    mkdir -p "$BACKUP_DIR" && chmod 700 "$BACKUP_DIR"
+    local out
+    out="$BACKUP_DIR/styk-panel-db-1-styk-$1-$(date -u +%Y%m%dT%H%M%SZ).dump"
+    compose exec -T db pg_dump -U styk -d styk -Fc >"$out.part"
+    mv -f "$out.part" "$out"
+    echo "$out"
+}
+
+# ---- commands ------------------------------------------------------------------------------
+
+cmd_setup() {
+    [ "${1:-}" = panel ] || die "usage: styk setup panel --domain panel.example.com [--email you@example.com] [--no-caddy] [--proxy-network NAME] [--version vX.Y.Z]"
+    shift
+    local domain="" email="" caddy=auto net="" ver=latest
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --domain) domain="${2:?}"; shift 2 ;;
+        --email) email="${2:?}"; shift 2 ;;
+        --no-caddy) caddy=no; shift ;;
+        --proxy-network) net="${2:?}"; shift 2 ;;
+        --version) ver="${2:?}"; shift 2 ;;
+        --yes | -y) YES=1; shift ;;
+        *) die "unknown option $1" ;;
+        esac
+    done
+    need_root setup
+    check_os
+    [ -f "$APP/.env" ] && die "$APP/.env exists: the panel is installed already, use 'styk update'"
+    if [ -n "$domain" ] && ! [[ "$domain" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
+        die "--domain must be a host name like panel.example.com"
+    fi
+    if [ "$caddy" = auto ]; then
+        if ports_busy; then
+            caddy=no
+            warn "ports 80/443 are taken: not starting the bundled Caddy, your proxy will serve the panel"
+        elif [ -z "$domain" ]; then
+            die "--domain is needed for HTTPS (or --no-caddy behind your own proxy)"
+        else
+            caddy=yes
+        fi
+    fi
+    net="${net:-styk-proxy}"
+
+    log "Checking the system"
+    ok "$(. /etc/os-release && echo "$PRETTY_NAME"), $(arch)"
+    export DEBIAN_FRONTEND=noninteractive
+    command -v curl >/dev/null && command -v ss >/dev/null || apt-get install -y -qq curl iproute2 >/dev/null
+    ensure_docker
+
+    log "Downloading Styk Panel"
+    local dir
+    dir="$(mktemp -d)"
+    TMP="$dir"
+    trap 'rm -rf "${TMP:-}"' EXIT
+    fetch "$ver" "$dir"
+    local version image
+    version="$(cat "$dir/VERSION")"
+    image="$(cat "$dir/IMAGE")"
+
+    log "Host agent"
+    install_agent "$dir" >/dev/null || die "styk-agent did not start: journalctl -u styk-agent"
+    ok "styk-agent running"
+    install_cli "$dir"
+    ok "styk CLI in $CLI"
+
+    log "Panel in $APP"
+    install -d -m 0750 "$APP"
+    install -m 0644 "$dir/compose.yml" "$APP/compose.yml"
+    local env="$APP/.env"
+    umask 077
+    {
+        echo "# Styk Panel settings; see env.example in the release. After a change: styk restart"
+        echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)"
+        echo "STYK_SECRET_KEY=$(openssl rand -base64 32)"
+        echo "DOCKER_GID=$(getent group docker | cut -d: -f3)"
+        echo "STYK_AGENT_GID=$(getent group styk-agent | cut -d: -f3)"
+        echo "STYK_IMAGE=$image"
+        echo "STYK_PUBLIC_URL=${domain:+https://$domain}"
+        echo "STYK_PROXY_NETWORK=$net"
+        if [ "$caddy" = yes ]; then
+            echo "COMPOSE_PROFILES=caddy"
+        else
+            echo "COMPOSE_PROFILES="
+            echo "# Your proxy's Caddyfile and container, if it is Caddy (Domains page):"
+            echo "# STYK_CADDYFILE=/path/to/Caddyfile"
+            echo "# STYK_CADDY_CONTAINER=caddy"
+        fi
+        echo "TELEGRAM_BOT_TOKEN="
+        echo "TELEGRAM_BOT_USERNAME="
+    } >"$env"
+    umask 022
+    install -m 0644 "$dir/env.example" "$APP/env.example"
+    if [ "$caddy" = yes ]; then
+        install -d "$APP/caddy"
+        if [ ! -f "$APP/caddy/Caddyfile" ]; then
+            {
+                echo "# Caddy for Styk Panel. Sites added on the Domains page go below."
+                if [ -n "$email" ]; then printf '{\n\temail %s\n}\n' "$email"; fi
+                echo
+                printf '%s {\n\tencode zstd gzip\n\theader -Server\n\treverse_proxy styk-panel:8080\n}\n' "$domain"
+            } >"$APP/caddy/Caddyfile"
+        fi
+    fi
+    docker network inspect "$net" >/dev/null 2>&1 || docker network create "$net" >/dev/null
+    ok "network $net"
+
+    log "Starting (first start pulls the images)"
+    load_local_image
+    compose pull -q --ignore-pull-failures
+    compose up -d --quiet-pull --wait --wait-timeout 180 || { compose logs --tail 50; die "the panel did not become healthy"; }
+    mkdir -p "$STATE_DIR" && echo "$version" >"$STATE_DIR/version"
+    ok "panel $version is up"
+
+    local pw=""
+    if ! compose exec -T panel styk-panel user list | grep -q .; then
+        pw="$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-20)"
+        compose exec -T -e STYK_PASSWORD="$pw" panel styk-panel user create admin >/dev/null
+    fi
+    if [ -r /etc/docker/daemon.json ] && grep -q '"log-opts"' /etc/docker/daemon.json; then :; else
+        warn "Docker keeps container logs forever by default; to cap them, see 'styk doctor'"
+    fi
+
+    echo
+    printf '%sStyk Panel %s is installed.%s\n\n' "$B" "$version" "$N"
+    if [ "$caddy" = yes ]; then
+        echo "  Open:      https://$domain  (point its DNS A record to this server first)"
+    else
+        echo "  Proxy:     send ${domain:-your panel domain} to styk-panel:8080; connect your proxy"
+        echo "             container to the network: docker network connect $net <proxy container>"
+        echo "             Caddy:  ${domain:-panel.example.com} { reverse_proxy styk-panel:8080 }"
+    fi
+    if [ -n "$pw" ]; then
+        echo "  Login:     admin"
+        echo "  Password:  $pw   (shown once; two-factor setup follows on first sign-in)"
+    fi
+    echo "  Manage:    styk status | styk update | styk doctor"
+}
+
+cmd_status() {
+    local img
+    img="$(env_get STYK_IMAGE)"
+    echo "version:  $(cat "$STATE_DIR/version" 2>/dev/null || echo unknown)"
+    echo "image:    ${img:-unset}"
+    echo "agent:    $(systemctl is-active styk-agent 2>/dev/null || true)"
+    if [ -f "$STATE_DIR/update.json" ]; then echo "update:   $(cat "$STATE_DIR/update.json")"; fi
+    compose ps --format 'table {{.Service}}\t{{.Status}}' 2>/dev/null || true
+}
+
+cmd_update() {
+    local ver=latest
+    while [ $# -gt 0 ]; do
+        case "$1" in
+        --yes | -y) YES=1; shift ;;
+        v*) ver="$1"; shift ;;
+        latest) shift ;;
+        *) die "usage: styk update [--yes] [vX.Y.Z]" ;;
+        esac
+    done
+    need_root update
+    [ -f "$APP/.env" ] || die "$APP/.env is missing: install first (styk setup panel)"
+    mkdir -p "$STATE_DIR"
+    exec 9>"$STATE_DIR/update.lock"
+    flock -n 9 || die "another update is running"
+    # Everything below also goes to the log the panel shows.
+    : >"$STATE_DIR/update.log"
+    exec > >(tee -a "$STATE_DIR/update.log") 2>&1
+    write_state running "$ver"
+
+    local dir
+    dir="$(mktemp -d)"
+    TMP="$dir"
+    trap 'rm -rf "${TMP:-}"' EXIT
+    log "Downloading $ver"
+    if ! (fetch "$ver" "$dir"); then
+        write_state failed "$ver" "download or verification failed"
+        exit 1
+    fi
+    local version image prev_image
+    version="$(cat "$dir/VERSION")"
+    image="$(cat "$dir/IMAGE")"
+    prev_image="$(env_get STYK_IMAGE)"
+    [ -n "$prev_image" ] || prev_image="$(docker inspect -f '{{.Config.Image}}' styk-panel-panel-1 2>/dev/null || true)"
+    if [ "$image" = "$prev_image" ] && cmp -s "$dir/styk-agent-linux-$(arch)" "$AGENT_BIN" &&
+        cmp -s "$dir/compose.yml" "$APP/compose.yml"; then
+        install_cli "$dir"
+        ok "already on $version"
+        write_state ok "$version"
+        return
+    fi
+    log "Updating $(cat "$STATE_DIR/version" 2>/dev/null || echo '?') -> $version"
+    if compose ps --status running -q db 2>/dev/null | grep -q .; then
+        ok "database saved to $(dump_db preupdate)"
+    fi
+    cp -p "$APP/compose.yml" "$STATE_DIR/compose.yml.prev"
+    printf 'STYK_IMAGE=%s\nVERSION=%s\n' "$prev_image" "$(cat "$STATE_DIR/version" 2>/dev/null)" >"$STATE_DIR/previous"
+
+    local agent_changed=""
+    if ! agent_changed="$(install_agent "$dir")"; then
+        warn "new styk-agent did not start, restoring the old one"
+        [ -f "$AGENT_BIN.old" ] && mv -f "$AGENT_BIN.old" "$AGENT_BIN" && systemctl restart styk-agent
+        write_state failed "$version" "styk-agent did not start"
+        exit 1
+    fi
+    [ -n "$agent_changed" ] && ok "styk-agent updated" || ok "styk-agent unchanged"
+
+    install -m 0644 "$dir/compose.yml" "$APP/compose.yml"
+    env_set STYK_IMAGE "$image"
+    load_local_image
+    if compose pull -q --ignore-pull-failures panel && compose up -d --quiet-pull --remove-orphans --wait --wait-timeout 180; then
+        echo "$version" >"$STATE_DIR/version"
+        install_cli "$dir"
+        install -m 0644 "$dir/env.example" "$APP/env.example"
+        ok "panel $version is up"
+        write_state ok "$version"
+        return
+    fi
+    compose logs --no-color --tail 60 panel || true
+    warn "health check failed, rolling back"
+    install -m 0644 "$STATE_DIR/compose.yml.prev" "$APP/compose.yml"
+    env_set STYK_IMAGE "$prev_image"
+    if [ -n "$agent_changed" ] && [ -f "$AGENT_BIN.old" ]; then
+        cp -p "$AGENT_BIN.old" "$AGENT_BIN" && systemctl restart styk-agent
+    fi
+    compose up -d --quiet-pull --remove-orphans --wait --wait-timeout 180 || true
+    write_state failed "$version" "panel health check failed, rolled back"
+    exit 1
+}
+
+cmd_rollback() {
+    need_root rollback
+    [ -f "$STATE_DIR/previous" ] || die "nothing to roll back to"
+    local img ver
+    img="$(sed -n 's/^STYK_IMAGE=//p' "$STATE_DIR/previous")"
+    ver="$(sed -n 's/^VERSION=//p' "$STATE_DIR/previous")"
+    [ -n "$img" ] || die "no previous image recorded"
+    confirm "Roll back to ${ver:-$img}?" || exit 1
+    [ -f "$STATE_DIR/compose.yml.prev" ] && install -m 0644 "$STATE_DIR/compose.yml.prev" "$APP/compose.yml"
+    env_set STYK_IMAGE "$img"
+    if [ -f "$AGENT_BIN.old" ]; then
+        cp -p "$AGENT_BIN.old" "$AGENT_BIN" && systemctl restart styk-agent
+    fi
+    compose up -d --quiet-pull --remove-orphans --wait --wait-timeout 180
+    [ -n "$ver" ] && echo "$ver" >"$STATE_DIR/version"
+    ok "back on ${ver:-$img}"
+}
+
+cmd_doctor() {
+    local fail=0 url host days free pct latest cur
+    printf '%sStyk Panel doctor%s\n' "$B" "$N"
+    if docker info >/dev/null 2>&1; then ok "Docker $(docker version --format '{{.Server.Version}}')"; else bad "Docker is not running"; fail=1; fi
+    if docker compose version >/dev/null 2>&1; then ok "$(docker compose version --short | sed 's/^/Compose /')"; else bad "docker compose plugin missing"; fail=1; fi
+    if systemctl is-active --quiet styk-agent; then ok "styk-agent active"; else bad "styk-agent is $(systemctl is-active styk-agent): journalctl -u styk-agent"; fail=1; fi
+    [ -S /run/styk-agent/agent.sock ] && ok "agent socket" || { bad "no /run/styk-agent/agent.sock"; fail=1; }
+    local health
+    health="$(docker inspect -f '{{.State.Health.Status}}' styk-panel-panel-1 2>/dev/null || echo missing)"
+    [ "$health" = healthy ] && ok "panel container healthy" || { bad "panel container: $health (styk logs panel)"; fail=1; }
+    health="$(docker inspect -f '{{.State.Health.Status}}' styk-panel-db-1 2>/dev/null || echo missing)"
+    [ "$health" = healthy ] && ok "database healthy" || { bad "database: $health (styk logs db)"; fail=1; }
+    if [ "$(env_get COMPOSE_PROFILES)" = caddy ]; then
+        [ "$(docker inspect -f '{{.State.Running}}' styk-panel-caddy-1 2>/dev/null)" = true ] && ok "Caddy running" || { bad "Caddy is not running (styk logs caddy)"; fail=1; }
+    fi
+    url="$(env_get STYK_PUBLIC_URL)"
+    if [ -n "$url" ]; then
+        if curl -fs --max-time 10 -o /dev/null "$url/healthz" 2>/dev/null; then ok "$url answers"; else bad "$url/healthz does not answer (DNS, proxy or firewall)"; fail=1; fi
+        host="${url#https://}"; host="${host%%/*}"
+        days="$(echo | timeout 10 openssl s_client -servername "$host" -connect "$host:443" 2>/dev/null |
+            openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)" || true
+        if [ -n "$days" ]; then
+            days=$(( ($(date -d "$days" +%s) - $(date +%s)) / 86400 ))
+            [ "$days" -gt 14 ] && ok "certificate valid for $days days" || { bad "certificate expires in $days days"; fail=1; }
+        fi
+    else
+        warn "STYK_PUBLIC_URL is not set in $APP/.env"
+    fi
+    for p in / /var/lib/docker; do
+        [ -d "$p" ] || continue
+        pct="$(df --output=pcent "$p" | tail -1 | tr -dc 0-9)"
+        free="$(df -h --output=avail "$p" | tail -1 | tr -d ' ')"
+        [ "$pct" -lt 90 ] && ok "disk $p: $pct% used, $free free" || { bad "disk $p: $pct% used, $free free"; fail=1; }
+    done
+    if grep -qs '"log-opts"' /etc/docker/daemon.json; then ok "Docker log rotation configured"; else
+        warn "container logs grow without limit; add to /etc/docker/daemon.json and restart Docker:"
+        warn '  {"log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"3"}}'
+    fi
+    cur="$(cat "$STATE_DIR/version" 2>/dev/null || echo unknown)"
+    latest="$(curl -fsS --max-time 10 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | sed -n 's/^ *"tag_name": *"\([^"]*\)".*/\1/p')" || true
+    if [ -z "$latest" ]; then warn "could not check GitHub for a newer release"
+    elif [ "$latest" = "$cur" ]; then ok "version $cur is the newest"
+    else warn "version $cur, newest is $latest: styk update"; fi
+    return "$fail"
+}
+
+cmd_logs() {
+    case "${1:-panel}" in
+    agent) journalctl -u styk-agent -n 200 -f ;;
+    panel | db | caddy) compose logs -f --tail 200 "${1:-panel}" ;;
+    update) cat "$STATE_DIR/update.log" ;;
+    *) die "usage: styk logs [panel|db|caddy|agent|update]" ;;
+    esac
+}
+
+cmd_backup() {
+    need_root backup
+    ok "saved $(dump_db manual)"
+}
+
+cmd_passwd() {
+    need_root passwd
+    local user="${1:?usage: styk passwd <user>}" pw
+    pw="$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-20)"
+    compose exec -T -e STYK_PASSWORD="$pw" panel styk-panel user passwd "$user" >/dev/null
+    echo "new password for $user: $pw"
+}
+
+cmd_restart() {
+    need_root restart
+    systemctl restart styk-agent
+    compose up -d --wait --wait-timeout 180
+    ok "restarted"
+}
+
+cmd_uninstall() {
+    local purge=0
+    for a in "$@"; do
+        case "$a" in --purge) purge=1 ;; --yes | -y) YES=1 ;; *) die "usage: styk uninstall [--purge] [--yes]" ;; esac
+    done
+    need_root uninstall
+    if [ "$purge" = 1 ]; then
+        confirm "Remove Styk Panel AND its database, Caddy certificates and $APP?" || exit 1
+        compose down -v --remove-orphans || true
+    else
+        confirm "Remove Styk Panel (the database and $APP stay)?" || exit 1
+        compose down --remove-orphans || true
+    fi
+    systemctl disable --now styk-agent 2>/dev/null || true
+    rm -f "$AGENT_UNIT" "$AGENT_BIN" "$AGENT_BIN.old"
+    systemctl daemon-reload
+    if [ "$purge" = 1 ]; then
+        rm -rf "$APP" "$STATE_DIR" "$AGENT_ENV"
+        getent group styk-agent >/dev/null && groupdel styk-agent || true
+    fi
+    rm -f "$CLI"
+    if [ "$purge" = 1 ]; then ok "removed, data included"; else ok "removed; data kept in $APP and the Docker volumes"; fi
+}
+
+case "${1:-}" in
+setup) shift; cmd_setup "$@" ;;
+status) cmd_status ;;
+update) shift; cmd_update "$@" ;;
+rollback) shift; [ "${1:-}" = --yes ] && YES=1; cmd_rollback ;;
+doctor) cmd_doctor ;;
+logs) shift; cmd_logs "$@" ;;
+backup) cmd_backup ;;
+passwd) shift; cmd_passwd "$@" ;;
+restart) cmd_restart ;;
+uninstall) shift; cmd_uninstall "$@" ;;
+version | --version | -V) echo "styk $CLI_VERSION" ;;
+"" | help | -h | --help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' ;;
+*) die "unknown command $1 (styk help)" ;;
+esac

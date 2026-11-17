@@ -1,0 +1,106 @@
+# CI: every push and pull request.
+#
+#   Rust      fmt, clippy, tests
+#   Rust      musl release build (in parallel with the checks)
+#   Frontend  types, lint, static export
+#
+# Releases are built by release.yml from a vX.Y.Z tag.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  rust-check:
+    name: Rust · fmt, clippy, tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # No debuginfo in CI: smaller cache, faster compile and link.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Format
+        run: cargo fmt --all --check
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --locked
+
+  # Runs in parallel with rust-check: the release build is the longest step.
+  rust-build:
+    name: Rust · release binaries (musl)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.RUST_TARGET }}
+      - run: sudo apt-get install -y --no-install-recommends musl-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Release binaries (static musl)
+        run: |
+          cargo build --release --locked --target "$RUST_TARGET" -p styk-panel -p styk-agent
+          mkdir -p bin && cp target/$RUST_TARGET/release/{styk-panel,styk-agent} bin/
+          ls -lh bin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: bin/
+          retention-days: 7
+
+  frontend:
+    name: Frontend · check & build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - name: Types
+        run: npx tsc --noEmit
+      - name: Lint
+        run: npm run lint
+      - name: Static export
+        run: npm run build
+        env:
+          NODE_ENV: production
+      - uses: actions/upload-artifact@v4
+        with:
+          name: www
+          path: frontend/out/
+          retention-days: 7

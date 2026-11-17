@@ -1,0 +1,18 @@
+# Loads the IP access rules (SSH allowlist, blocklist) that styk-agent generates from
+# /etc/styk-access.json. Installed by hand: the release bundle does not ship it.
+[Unit]
+Description=Styk Panel IP access rules (nft table inet styk_access)
+After=network-pre.target
+Wants=network-pre.target
+ConditionPathExists=/etc/styk-access.nft
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/styk-access.nft
+# GitHub Actions ranges for the SSH allowlist; missing on a fresh host.
+ExecStartPost=-/bin/sh -c '[ ! -s /etc/styk-access-github.nft ] || /usr/sbin/nft -f /etc/styk-access-github.nft'
+ExecStop=/usr/sbin/nft delete table inet styk_access
+
+[Install]
+WantedBy=multi-user.target

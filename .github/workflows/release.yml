@@ -1,0 +1,209 @@
+# Release: push a tag vX.Y.Z (equal to the workspace version in Cargo.toml).
+#
+#   binaries   styk-panel and styk-agent, static musl, amd64 and arm64 (native runners)
+#   frontend   Next.js static export, precompressed
+#   image      ghcr.io/<owner>/styk-panel:vX.Y.Z, :X.Y and :latest, linux/amd64 + linux/arm64
+#   publish    GitHub release: install.sh, styk, compose.yml, env.example, the agent and its
+#              unit, VERSION, IMAGE (image pinned by digest), SHA256SUMS + minisign signature
+#
+# The signing key lives only in the `release` environment (secret MINISIGN_SECRET_KEY, a
+# minisign key without password); its public half is deploy/minisign.pub, which install.sh
+# and styk carry and check every download against.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: |
+          want="v$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)"
+          [ "$GITHUB_REF_NAME" = "$want" ] || { echo "::error::tag $GITHUB_REF_NAME, Cargo.toml says $want"; exit 1; }
+
+  binaries:
+    name: Binaries · ${{ matrix.arch }}
+    needs: version
+    strategy:
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-24.04, target: x86_64-unknown-linux-musl }
+          - { arch: arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: sudo apt-get install -y --no-install-recommends musl-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.arch }}
+      - name: Test
+        run: cargo test --locked
+      - name: Build
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} -p styk-panel -p styk-agent
+          mkdir -p out/${{ matrix.arch }}
+          cp target/${{ matrix.target }}/release/{styk-panel,styk-agent} out/${{ matrix.arch }}/
+          file out/${{ matrix.arch }}/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.arch }}
+          path: out/
+          retention-days: 7
+
+  frontend:
+    name: Frontend
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npx tsc --noEmit
+      - run: npm run lint
+      - run: npm run build
+        env:
+          NODE_ENV: production
+      - uses: actions/upload-artifact@v4
+        with:
+          name: www
+          path: frontend/out/
+          retention-days: 7
+
+  image:
+    name: Image
+    needs: [binaries, frontend]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      ref: ${{ steps.ref.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: bin-*
+          merge-multiple: true
+          path: ctx
+      - uses: actions/download-artifact@v5
+        with:
+          name: www
+          path: ctx/www
+      - run: chmod +x ctx/*/styk-*
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: name
+        run: |
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          v="${GITHUB_REF_NAME#v}"; echo "minor=${v%.*}" >> "$GITHUB_OUTPUT"
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ctx
+          file: deploy/Dockerfile
+          target: prebuilt
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.name.outputs.image }}:${{ github.ref_name }}
+            ${{ steps.name.outputs.image }}:${{ steps.name.outputs.minor }}
+            ${{ steps.name.outputs.image }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.licenses=MIT
+      - id: ref
+        run: echo "ref=${{ steps.name.outputs.image }}:${{ github.ref_name }}@${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
+      - name: Smoke test
+        run: |
+          docker run --rm --platform linux/amd64 "${{ steps.ref.outputs.ref }}" --help >/dev/null
+          docker run --rm --platform linux/amd64 "${{ steps.ref.outputs.ref }}" healthcheck 2>&1 | grep -q "Connection refused"
+
+  publish:
+    name: GitHub release
+    needs: image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: bin-*
+          merge-multiple: true
+          path: bin
+      - run: sudo apt-get install -y --no-install-recommends minisign
+      - name: Assemble
+        env:
+          IMAGE: ${{ needs.image.outputs.ref }}
+        run: |
+          mkdir dist
+          pub="$(sed -n 2p deploy/minisign.pub)"
+          [ -n "$pub" ] || { echo "::error::deploy/minisign.pub is empty"; exit 1; }
+          for f in styk install.sh; do
+            sed -e "s|@STYK_REPO@|$GITHUB_REPOSITORY|g" -e "s|@MINISIGN_PUBKEY@|$pub|g" -e "s|@VERSION@|$GITHUB_REF_NAME|g" \
+              deploy/$f > dist/$f
+            chmod +x dist/$f
+            if grep -n '@[A-Z_]*@' dist/$f; then echo "::error::placeholder left in $f"; exit 1; fi
+          done
+          cp deploy/compose.yml deploy/env.example deploy/styk-agent.service dist/
+          for a in amd64 arm64; do install -m 0755 bin/$a/styk-agent dist/styk-agent-linux-$a; done
+          echo "$GITHUB_REF_NAME" > dist/VERSION
+          echo "$IMAGE" > dist/IMAGE
+          (cd dist && sha256sum * > SHA256SUMS)
+      - name: Sign
+        env:
+          KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          umask 077
+          printf '%s\n' "$KEY" > "$RUNNER_TEMP/minisign.key"
+          minisign -S -s "$RUNNER_TEMP/minisign.key" -m dist/SHA256SUMS -t "styk-panel $GITHUB_REF_NAME" < /dev/null
+          rm -f "$RUNNER_TEMP/minisign.key"
+          minisign -Vm dist/SHA256SUMS -p deploy/minisign.pub
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "## Install"
+            echo
+            echo '```bash'
+            echo "curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/install.sh | sudo bash -s -- panel --domain panel.example.com"
+            echo '```'
+            echo
+            echo "Update an existing server: \`styk update\` or Settings → Updates in the panel."
+            echo
+            echo "Image: \`$(cat dist/IMAGE)\`"
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag

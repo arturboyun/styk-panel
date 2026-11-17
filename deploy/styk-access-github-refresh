@@ -1,0 +1,28 @@
+#!/bin/sh
+# Refreshes GitHub Actions ranges (api.github.com/meta "actions") for the panel's SSH
+# allowlist: writes /etc/styk-access-github.nft and loads it into sets inet styk_access
+# gh4/gh6. Run daily by styk-access-github-refresh.timer; installed by hand to
+# /usr/local/sbin. On any failure the previous list stays.
+set -eu
+OUT=/etc/styk-access-github.nft
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
+curl -fsS --max-time 30 https://api.github.com/meta | python3 -c '
+import ipaddress, json, sys
+a = json.load(sys.stdin)["actions"]
+v4 = [str(ipaddress.ip_network(x)) for x in a if ":" not in x]
+v6 = [str(ipaddress.ip_network(x)) for x in a if ":" in x]
+if len(v4) < 100: sys.exit("suspiciously short list")
+print("flush set inet styk_access gh4")
+print("flush set inet styk_access gh6")
+print("add element inet styk_access gh4 { " + ", ".join(v4) + " }")
+if v6: print("add element inet styk_access gh6 { " + ", ".join(v6) + " }")
+' > "$TMP"
+if nft list table inet styk_access >/dev/null 2>&1; then
+    nft -c -f "$TMP"
+    nft -f "$TMP"
+fi
+install -m 0644 "$TMP" "$OUT"
+n=$(grep '^add element' "$OUT" | tr -cd , | wc -c)
+l=$(grep -c '^add element' "$OUT")
+echo "github ranges: $((n + l))"

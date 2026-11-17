@@ -1,0 +1,9 @@
+# Installed by hand with styk-access-github-refresh (see README).
+[Unit]
+Description=Refresh GitHub Actions ranges for the Styk Panel SSH allowlist
+After=network-online.target styk-access-firewall.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/styk-access-github-refresh

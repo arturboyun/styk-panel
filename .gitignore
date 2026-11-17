@@ -1,0 +1,8 @@
+/target
+/frontend/node_modules
+/frontend/.next
+/frontend/out
+.env
+*.sock
+.dev/
+dist/

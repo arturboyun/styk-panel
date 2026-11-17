@@ -1,0 +1,86 @@
+# Styk Panel: /opt/styk-panel/compose.yml, written by install.sh and `styk update`.
+#
+# Settings live in .env next to this file (see env.example). Host-side work goes through
+# styk-agent (systemd), reached over the unix socket in /run/styk-agent.
+#
+# HTTPS: with COMPOSE_PROFILES=caddy the bundled Caddy below serves the panel and any site
+# added on the Domains page. Without it, an existing reverse proxy reaches the panel as
+# `styk-panel:8080` on the external network STYK_PROXY_NETWORK.
+name: styk-panel
+
+services:
+  panel:
+    image: ${STYK_IMAGE:-ghcr.io/arturboyun/styk-panel:latest}
+    restart: unless-stopped
+    command: ["serve"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://styk:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/styk
+      STYK_TRUST_PROXY: "true"
+      STYK_AGENT_SOCKET: /run/styk-agent/agent.sock
+    # Docker socket and agent socket access, by numeric gid of the host groups.
+    group_add:
+      - "${DOCKER_GID:?set DOCKER_GID (getent group docker)}"
+      - "${STYK_AGENT_GID:?set STYK_AGENT_GID (getent group styk-agent)}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /run/styk-agent:/run/styk-agent
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    pids_limit: 256
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      internal: {}
+      proxy:
+        aliases: [styk-panel]
+
+  db:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: styk
+      POSTGRES_DB: styk
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    command: ["postgres", "-c", "shared_buffers=64MB", "-c", "work_mem=4MB", "-c", "max_connections=30"]
+    volumes:
+      - db:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U styk -d styk"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    mem_limit: 256m
+    networks: [internal]
+
+  caddy:
+    profiles: [caddy]
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    # The whole directory, not the file: a file mount pins the inode, and the panel saves
+    # the Caddyfile by rename.
+    volumes:
+      - ./caddy:/etc/caddy
+      - caddy_data:/data
+      - caddy_config:/config
+    mem_limit: 256m
+    networks: [proxy]
+
+volumes:
+  db:
+  caddy_data:
+  caddy_config:
+
+networks:
+  internal: {}
+  # Apps that the Caddy proxies to join this network under a unique alias.
+  proxy:
+    external: true
+    name: ${STYK_PROXY_NETWORK:-styk-proxy}
